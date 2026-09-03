@@ -64,6 +64,12 @@ async for event in agent.run_events(options=options):
 `SessionLog` 是 Agent 会话持久化状态的唯一事实源。它记录并恢复消息、工具
 调用与结果、Goal、Plan、Todo、活动 Skill、压缩记录和轮次边界等通用事实。
 
+CLI 使用 `--session-id`/`--resume` 选择稳定的逻辑 Session ID；未提供时每次进程
+启动创建新的 CLI Session。ACP 继续使用宿主 `_meta.session_id` 作为逻辑 ID，ACP
+自身的 `sessionId` 只是进程内运行句柄。两种 Adapter 都通过同一个
+`SessionLog.open_or_create()` 和 `Agent(session_log=...)` 恢复；system prompt、权限、
+MCP 连接和 sandbox 等运行时对象仍按当前配置重新构建。
+
 一个 Session 在整个生命周期内只拥有一个规范化 cwd。用不同 workspace 打开
 同一 Session 时，会在修复或修改日志之前失败。语法等价路径可以接受；
 symlink alias 被视为不同的 workspace identity。

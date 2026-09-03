@@ -494,6 +494,7 @@ class Agent:
         tool_limits: ToolLimitsConfig | None = None,
         deferred_mcp_loading_enabled: bool = True,
         session_log: SessionLog | None = None,
+        session_id: str = "",
     ):
         self.llm = llm_client
         self.tools = {
@@ -602,6 +603,7 @@ class Agent:
         self.tools["goal_read"] = _GoalReadTool(self)
         self.tools["goal_write"] = _GoalWriteTool(self)
         self.session_log = session_log
+        self.session_id = session_id.strip()
         if self.session_log is not None:
             projection = self.session_log.replay()
             self.messages.extend(projection.messages)
@@ -977,6 +979,8 @@ class Agent:
         removed = max(0, len(self.messages) - 1)
         del self.messages[1:]
         self.context_resource_ledger.rotate_epoch()
+        if self.session_log is not None:
+            self.session_log.reset_surface(reason="agent.clear_history")
         return removed
 
     def _check_cancelled(self) -> bool:
@@ -996,6 +1000,7 @@ class Agent:
             memory_manager=getattr(self._memory_extractor, "_mgr", None),
             memory_extractor=self._memory_extractor,
             inject_queue=self.inject_queue,
+            session_id=self.session_id,
             max_tool_calls=self.tool_limits.general.max_tool_calls,
             max_delegated_tool_calls=(
                 self.tool_limits.general.max_delegated_tool_calls

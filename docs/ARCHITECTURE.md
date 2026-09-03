@@ -69,6 +69,13 @@ such as `SubAgentTool`, may import `run_agent_loop` from
 records and replays generic facts: messages, tool calls and results, goals,
 plans, todos, active Skills, compaction records, and turn boundaries.
 
+The CLI selects a logical Session with `--session-id`/`--resume`; without an
+explicit ID, each process starts a fresh CLI Session. ACP uses the host-provided
+`_meta.session_id` as its logical ID, while its own `sessionId` is only a
+process-local handle. Both adapters use the same SessionLog open/create path and
+construct current system prompts, permissions, MCP connections, and sandbox
+runtime from current configuration.
+
 A Session owns one normalized cwd for its entire lifetime. Opening the same
 Session with another workspace fails before the log is repaired or mutated.
 Syntactically equivalent paths are accepted; a symlink alias is a distinct

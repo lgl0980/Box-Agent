@@ -142,7 +142,7 @@ from box_agent.llm.model_profiles import client_for_model_profile
 from box_agent.llm.token_meter import get_token_meter, reset_token_meter, start_token_meter
 from box_agent.runtime import invoke_tool_with_permissions
 from box_agent.session_trace import SessionTraceWriter, scoped_session_trace
-from box_agent.session_log import SessionLog
+from box_agent.session_log import SessionLog, default_session_root
 from box_agent.task_context import TaskContext, normalize_task_id
 from box_agent.session_continuation import parse_session_continuation
 from box_agent.task_registry import (
@@ -1925,22 +1925,14 @@ class BoxACPAgent:
                     existing_log.assert_workspace(workspace)
                     existing_log.close()
                 del self._sessions[existing_handle]
-            session_root = Path.home() / ".box-agent" / "sessions"
-            try:
-                session_log = SessionLog.open(
-                    session_root,
-                    session_id=upstream_session_id,
-                    cwd=workspace,
-                )
-            except FileNotFoundError:
-                session_log = SessionLog.create(
-                    session_root,
-                    session_id=upstream_session_id,
-                    cwd=workspace,
-                )
-            else:
-                session_log.prepare_resume()
-                session_log_restored = True
+            opened = SessionLog.open_or_create(
+                default_session_root(),
+                session_id=upstream_session_id,
+                cwd=workspace,
+                origin="acp",
+            )
+            session_log = opened.log
+            session_log_restored = opened.resumed
 
         agent = Agent(
             llm_client=session_llm,
@@ -1970,6 +1962,7 @@ class BoxACPAgent:
                 and self._config.tools.mcp.deferred_loading_enabled
             ),
             session_log=session_log,
+            session_id=upstream_session_id or session_id,
         )
 
         if skillhub_search_tool is not None:

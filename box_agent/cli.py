@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -83,6 +84,7 @@ from box_agent.trace_viewer import launch_trace_viewer
 from box_agent.utils import calculate_display_width
 from box_agent.acp.project_context import build_project_startup_context_prompt
 from box_agent.workspace_registry import WorkspaceRegistry, WorkspaceRegistryError
+from box_agent.session_log import SessionLog, default_session_root
 
 
 _CLI_PROBE_MAX_OUTPUT_TOKENS = 4_096
@@ -632,6 +634,7 @@ def print_help():
 {Colors.BOLD}{Colors.BRIGHT_YELLOW}Usage:{Colors.RESET}
   - Enter your task directly, Agent will help you complete it
   - Agent remembers all conversation content in this session
+  - Use {Colors.BRIGHT_GREEN}--session-id ID{Colors.RESET} or {Colors.BRIGHT_GREEN}--resume ID{Colors.RESET} to restore a durable SessionLog session
   - Use {Colors.BRIGHT_GREEN}/clear{Colors.RESET} to start a new session (sandbox variables persist)
   - Use {Colors.BRIGHT_GREEN}/clear_all{Colors.RESET} to start completely fresh (kills sandbox kernel)
   - Press {Colors.BRIGHT_CYAN}Enter{Colors.RESET} to submit your message
@@ -668,6 +671,8 @@ def print_session_info(agent: Agent, workspace_dir: Path, model: str):
     # Info lines
     print_info_line(f"Model: {model}")
     print_info_line(f"Workspace: {workspace_dir}")
+    if agent.session_log is not None:
+        print_info_line(f"Session ID: {agent.session_log.header.get('id', '')}")
     print_info_line(f"Message History: {len(agent.messages)} messages")
     print_info_line(f"Available Tools: {len(agent.tools)} tools")
 
@@ -784,10 +789,16 @@ def _save_goal_state(workspace_dir: Path, goal: GoalState | None) -> None:
 
 
 def _restore_cli_goal(agent: Agent, workspace_dir: Path) -> GoalState | None:
+    # SessionLog is the canonical store. Import the legacy workspace-scoped
+    # goal once only when the durable session has no goal yet.
+    if agent.goal is not None:
+        return agent.goal
     goal = _load_goal_state(workspace_dir)
     if goal is None:
         return None
     agent.goal = goal
+    if agent.session_log is not None:
+        agent._persist_goal()
     return goal
 
 
@@ -880,6 +891,135 @@ def handle_goal_command(agent: Agent, command_line: str) -> None:
     print(f"{Colors.DIM}   Future turns will include this objective until paused, completed, or cleared.{Colors.RESET}\n")
 
 
+def _cmd_session_goal(
+    workspace_dir: Path,
+    *,
+    session_id: str,
+    action: str,
+    text: list[str] | None,
+    evidence: list[str] | None,
+    progress: list[str] | None,
+    json_output: bool,
+) -> int:
+    """Manage a Goal stored in the canonical SessionLog projection."""
+    action = (action or "status").strip().lower()
+    text_value = " ".join(text or []).strip()
+    evidence_items = [item.strip() for item in (evidence or []) if item.strip()]
+    progress_items = [item.strip() for item in (progress or []) if item.strip()]
+    try:
+        opened = SessionLog.open_or_create(
+            default_session_root(),
+            session_id=session_id,
+            cwd=workspace_dir,
+            origin="cli",
+        )
+    except Exception as exc:
+        if json_output:
+            _json_print({"ok": False, "error": str(exc), "sessionId": session_id})
+        else:
+            print(f"{Colors.RED}❌ {exc}{Colors.RESET}")
+        return 1
+
+    log = opened.log
+    try:
+        goal = goal_state_from_payload(log.replay().goal)
+        now = datetime.now().isoformat()
+
+        def emit(ok: bool = True, error: str | None = None) -> int:
+            if json_output:
+                payload = {
+                    "ok": ok,
+                    "goal": goal_payload(goal),
+                    "sessionId": session_id,
+                    "resumed": opened.resumed,
+                }
+                if error:
+                    payload["error"] = error
+                _json_print(payload)
+            elif error:
+                print(f"{Colors.RED}❌ {error}{Colors.RESET}")
+            elif goal is None:
+                print(f"{Colors.DIM}No goal for session: {session_id}{Colors.RESET}")
+            else:
+                temp_agent = Agent.__new__(Agent)
+                temp_agent.goal = goal
+                print_goal_status(temp_agent)
+            return 0 if ok else 1
+
+        if action in ("status", "get"):
+            return emit()
+        if action == "set":
+            if not text_value:
+                return emit(False, "Goal objective is required.")
+            goal = GoalState(
+                objective=text_value,
+                status="active",
+                created_at=now,
+                updated_at=now,
+                evidence=evidence_items,
+                progress=progress_items,
+            )
+        elif action == "clear":
+            goal = None
+        else:
+            if goal is None:
+                return emit(False, "No goal is set for this session.")
+            if action == "pause":
+                goal.status = "paused"
+                goal.updated_at = now
+            elif action == "resume":
+                goal.status = "active"
+                goal.blocked_reason = None
+                goal.updated_at = now
+            elif action == "complete":
+                goal.status = "complete"
+                goal.blocked_reason = None
+                if text_value:
+                    evidence_items.append(text_value)
+                if not evidence_items:
+                    evidence_items.append("Completed via `box-agent goal complete`.")
+                for item in evidence_items:
+                    if item not in goal.evidence:
+                        goal.evidence.append(item)
+                for item in progress_items:
+                    if item not in goal.progress:
+                        goal.progress.append(item)
+                goal.completed_by = "cli"
+                goal.updated_at = now
+            elif action == "progress":
+                if text_value:
+                    progress_items.append(text_value)
+                if not progress_items:
+                    return emit(False, "Progress text is required.")
+                for item in progress_items:
+                    if item not in goal.progress:
+                        goal.progress.append(item)
+                for item in evidence_items:
+                    if item not in goal.evidence:
+                        goal.evidence.append(item)
+                goal.updated_at = now
+            elif action == "block":
+                if not text_value:
+                    return emit(False, "Blocked reason is required.")
+                goal.status = "blocked"
+                goal.blocked_reason = text_value
+                for item in evidence_items:
+                    if item not in goal.evidence:
+                        goal.evidence.append(item)
+                for item in progress_items:
+                    if item not in goal.progress:
+                        goal.progress.append(item)
+                goal.updated_at = now
+            else:
+                return emit(False, f"Unknown goal action: {action}")
+
+        log.append("goal/change", {"goal": goal_payload(goal)})
+        log.flush()
+        return emit()
+    finally:
+        log.close()
+
+
 def cmd_goal(
     workspace_dir: Path,
     action: str = "status",
@@ -887,8 +1027,19 @@ def cmd_goal(
     evidence: list[str] | None = None,
     progress: list[str] | None = None,
     json_output: bool = False,
+    session_id: str | None = None,
 ) -> int:
     """Scriptable CLI goal management without starting the agent runtime."""
+    if session_id and session_id.strip():
+        return _cmd_session_goal(
+            workspace_dir,
+            session_id=session_id.strip(),
+            action=action,
+            text=text,
+            evidence=evidence,
+            progress=progress,
+            json_output=json_output,
+        )
     action = (action or "status").strip().lower()
     text_value = " ".join(text or []).strip()
     evidence_items = [item.strip() for item in (evidence or []) if item.strip()]
@@ -1055,6 +1206,14 @@ Examples:
         help="Set or replace the persistent workspace goal before starting interactive/--task mode",
     )
     parser.add_argument(
+        "--session-id",
+        "--resume",
+        dest="session_id",
+        type=str,
+        default=None,
+        help="Resume or create a durable logical Session by ID",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit JSON where supported (doctor/config; --task appends a summary)",
@@ -1140,6 +1299,14 @@ Examples:
         type=str,
         default=None,
         help="Workspace directory for this goal command",
+    )
+    goal_parser.add_argument(
+        "--session-id",
+        "--resume",
+        dest="session_id",
+        type=str,
+        default=None,
+        help="Read or update the canonical durable SessionLog Goal",
     )
 
     # setup subcommand
@@ -1776,6 +1943,7 @@ async def run_agent(
     workspace_dir: Path,
     task: str | None = None,
     initial_goal: str | None = None,
+    session_id: str | None = None,
     sandbox_mode: bool = True,
     verify_api: bool = True,
     json_summary: bool = False,
@@ -1789,6 +1957,7 @@ async def run_agent(
         workspace_dir: Workspace directory path
         task: If provided, execute this task and exit (non-interactive mode)
         initial_goal: Optional goal objective to set before the first turn
+        session_id: Optional stable logical Session ID to resume or create
         sandbox_mode: If True (default), enable Jupyter sandbox for Python code execution
         verify_api: If True, probe API connectivity before starting the session
         json_summary: If True in non-interactive mode, append a JSON execution summary
@@ -2170,40 +2339,89 @@ async def run_agent(
             system_prompt = f"{system_prompt.rstrip()}\n\n{memory_block}"
             print(f"{Colors.GREEN}✅ Loaded memory context{Colors.RESET}")
 
+    # 7. Open the durable logical Session before constructing Agent. Without an
+    # explicit id, preserve the historical CLI behavior by starting a fresh
+    # session for each process invocation.
+    logical_session_id = (session_id or "").strip() or f"cli-{uuid4().hex}"
+    session_open = SessionLog.open_or_create(
+        default_session_root(),
+        session_id=logical_session_id,
+        cwd=workspace_dir,
+        origin="cli",
+    )
+    session_log = session_open.log
+
     # 7. Create Agent
     from box_agent.hooks import load_hooks
     hooks = load_hooks(config.hooks.hooks) if config.hooks.hooks else None
-    agent = Agent(
-        llm_client=llm_client,
-        system_prompt=system_prompt,
-        tools=tools,
-        max_steps=config.agent.max_steps,
-        tool_limits=config.tool_limits,
-        workspace_dir=str(workspace_dir),
-        token_limit=config.llm.context_token_limit,
-        hooks=hooks,
-        thinking_enabled=deep_think,
-        max_parallel_tools=config.agent.max_parallel_tools,
-        parallel_tool_timeout_seconds=config.agent.parallel_tool_timeout_seconds,
-        provider_stale_seconds=config.agent.provider_stale_seconds,
-        memory_promotion_enabled=config.agent.memory_promotion_proposal_enabled,
-        memory_promotion_hit_threshold=config.agent.memory_promotion_hit_threshold,
-        memory_promotion_cooldown_days=config.agent.memory_promotion_cooldown_days,
-        truncation_continuation_enabled=config.agent.retry_on_suspected_truncation,
-        max_truncation_continuations=config.agent.max_truncation_continuations,
-        max_truncated_tool_call_retries=config.agent.max_truncated_tool_call_retries,
-        truncated_tool_call_boost_cap=config.agent.truncated_tool_call_boost_cap,
-        context_resource_dedup_enabled=config.agent.context_resource_dedup_enabled,
-        deferred_mcp_loading_enabled=(
-            config.tools.enable_mcp
-            and config.tools.mcp.deferred_loading_enabled
-        ),
-    )
+    try:
+        agent = Agent(
+            llm_client=llm_client,
+            system_prompt=system_prompt,
+            tools=tools,
+            max_steps=config.agent.max_steps,
+            tool_limits=config.tool_limits,
+            workspace_dir=str(workspace_dir),
+            token_limit=config.llm.context_token_limit,
+            hooks=hooks,
+            thinking_enabled=deep_think,
+            max_parallel_tools=config.agent.max_parallel_tools,
+            parallel_tool_timeout_seconds=config.agent.parallel_tool_timeout_seconds,
+            provider_stale_seconds=config.agent.provider_stale_seconds,
+            memory_promotion_enabled=config.agent.memory_promotion_proposal_enabled,
+            memory_promotion_hit_threshold=config.agent.memory_promotion_hit_threshold,
+            memory_promotion_cooldown_days=config.agent.memory_promotion_cooldown_days,
+            truncation_continuation_enabled=config.agent.retry_on_suspected_truncation,
+            max_truncation_continuations=config.agent.max_truncation_continuations,
+            max_truncated_tool_call_retries=config.agent.max_truncated_tool_call_retries,
+            truncated_tool_call_boost_cap=config.agent.truncated_tool_call_boost_cap,
+            context_resource_dedup_enabled=config.agent.context_resource_dedup_enabled,
+            deferred_mcp_loading_enabled=(
+                config.tools.enable_mcp
+                and config.tools.mcp.deferred_loading_enabled
+            ),
+            session_log=session_log,
+            session_id=logical_session_id,
+        )
+    except BaseException:
+        session_log.close()
+        raise
 
-    restored_goal = _restore_cli_goal(agent, workspace_dir)
-    if initial_goal and initial_goal.strip():
-        restored_goal = agent.set_goal(initial_goal)
-        _save_goal_state(workspace_dir, agent.goal)
+    if agent.restored_skills:
+        try:
+            if skill_loader is None:
+                raise ValueError(
+                    "persisted active Skills cannot be restored without a SkillLoader"
+                )
+            restored_skill_prompts: list[tuple[str, str, str, int]] = []
+            for item in agent.restored_skills:
+                name = item.get("name")
+                prompt_hash = item.get("sha256")
+                load_order = item.get("loadOrder")
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(prompt_hash, str)
+                    or not isinstance(load_order, int)
+                ):
+                    raise ValueError("persisted active Skill metadata is invalid")
+                skill = skill_loader.get_skill(name)
+                if skill is None:
+                    raise ValueError(f"persisted active Skill {name!r} is unavailable")
+                restored_skill_prompts.append(
+                    (name, skill.to_prompt(), prompt_hash, load_order)
+                )
+            agent.restore_active_skill_instructions(restored_skill_prompts)
+        except BaseException:
+            session_log.close()
+            raise
+
+    try:
+        restored_goal = _restore_cli_goal(agent, workspace_dir)
+        if initial_goal and initial_goal.strip():
+            restored_goal = agent.set_goal(initial_goal)
+    except BaseException:
+        session_log.close()
+        raise
 
     # Wire CLI permission negotiator (parity with ACP in-band negotiation)
     if grant_store is not None and not non_interactive:
@@ -2406,7 +2624,6 @@ async def run_agent(
                     f"\n{Colors.YELLOW}⚠️  Goal autopilot stopped after "
                     f"{auto_no_progress_turns} continuation(s) without recorded goal progress.{Colors.RESET}"
                 )
-            _save_goal_state(workspace_dir, agent.goal)
             if skill_scratch_dir is not None:
                 try:
                     cleanup_skill_scratch_dir(skill_scratch_dir)
@@ -2416,6 +2633,7 @@ async def run_agent(
                         f"{cleanup_error}{Colors.RESET}",
                         file=sys.stderr,
                     )
+            session_log.close()
             print_stats(agent, session_start)
             if json_summary:
                 waiting_for_user = (
@@ -2432,6 +2650,8 @@ async def run_agent(
                     "completed": ok and not waiting_for_user,
                     "workspace": str(workspace_dir),
                     "task": task,
+                    "sessionId": logical_session_id,
+                    "resumed": session_open.resumed,
                     "goal": goal_payload(agent.goal),
                     "goalAutopilot": {
                         "enabled": auto_enabled,
@@ -2619,7 +2839,6 @@ async def run_agent(
 
                 elif command == "/goal" or command.startswith("/goal "):
                     handle_goal_command(agent, user_input)
-                    _save_goal_state(workspace_dir, agent.goal)
                     continue
 
                 elif command == "/memory" or command.startswith("/memory "):
@@ -2762,7 +2981,6 @@ async def run_agent(
                 agent.cancel_event = None
                 esc_listener_stop.set()
                 esc_thread.join(timeout=0.2)
-                _save_goal_state(workspace_dir, agent.goal)
                 if skill_scratch_dir is not None:
                     try:
                         cleanup_skill_scratch_dir(skill_scratch_dir)
@@ -2795,6 +3013,7 @@ async def run_agent(
 
     # 11. Cleanup MCP connections
     await _quiet_cleanup()
+    session_log.close()
     return 0
 
 
@@ -2857,6 +3076,7 @@ def main() -> int:
             evidence=args.evidence,
             progress=args.progress,
             json_output=args.json,
+            session_id=getattr(args, "session_id", None),
         )
 
     # Ensure user config exists; run setup wizard on first launch
@@ -2897,6 +3117,7 @@ def main() -> int:
                 workspace_dir,
                 task=args.task,
                 initial_goal=args.goal,
+                session_id=getattr(args, "session_id", None),
                 sandbox_mode=not args.no_sandbox,
                 verify_api=not args.no_verify_api,
                 json_summary=args.json,
